@@ -166,12 +166,19 @@ type EFIDevicePathProtocol struct {
   Length uint16 // UINT8 Length[2]
 }
 
+func (p EFIDevicePathProtocol) CombinedType() int {
+  return int(p.TheType) * 256 + int(p.SubType)
+}
+
+// EFIDPNodePropertyMap
+type EFIDPNodePropertyMap map[string]string
+
 // EFIDevicePathNode defines the data stored in FilePathList
 // EFI Device Path Node is defined in section 9.3 of the UEFI 2.6 spec
 type EFIDevicePathNode struct {
   EFIDevicePathProtocol
   Data []byte
-  Properties map[string]string // if len is 0, then it's not parsed
+  Properties EFIDPNodePropertyMap // if len is 0, then it's not parsed
 }
 
 func (f EFIDevicePathNode) ToString(nIndent, level int) string {
@@ -264,7 +271,7 @@ func (l *EFILoadOption) Parse(data []byte) error {
   		return fmt.Errorf("failed to parse EFILoadOption.FilePathList[%d].EFIDevicePathProtocol: %w", i, err)
   	}
     bytesParsed += 4
-    if h.TheType == EFIEndDevicePathType && h.SubType == EFIEndDevicePathSubType {
+    if h.CombinedType() == EFIEndDevicePath {
       break
     }
     dLen := int(h.Length) - 4
@@ -299,46 +306,42 @@ func (l *EFILoadOption) Parse(data []byte) error {
 
 const (
   // types
-  EFIHardwareDevicePathType = 0x01 // Sec 9.3.2
-  EFIAcpiDevicePathType = 0x02 // Sec 9.3.3 and 9.3.4
-  EFIMessagingDevicePathType = 0x03 // Sec 9.3.5
-  EFIMediaDevicePathType = 0x04 // Sec 9.3.6
-  EFIEndDevicePathType = 0x7f // Sec 9.3.1
-
-  // subtypes
-  // EFIMediaDevicePathType
-  EFIMediaHarddriveDP = 0x01
-  EFIMediaFilePathDP = 0x04
-  // EFIEndDevicePathType
-  EFIEndDevicePathSubType = 0xff
+  // EFIHardwareDevicePathType (0x01xx), Sec 9.3.2
+  // EFIAcpiDevicePathType (0x02xx), Sec 9.3.3 and 9.3.4
+  // EFIMessagingDevicePathType (0x03xx), Sec 9.3.5
+  // EFIMediaDevicePathType (0x04xx), Sec 9.3.6
+  EFIMediaHarddriveDevicePath = 0x0401
+  EFIMediaFilePathDevicePath = 0x0404
+  // EFIBIOSBootSpecDevicePathType (0x05xx), Sec 9.3.7
+  // EFIEndDevicePathType, Sec 9.3.1
+  EFIEndDevicePath = 0x7fff
 )
 
-func ParseDevicePathNode(data []byte, h EFIDevicePathProtocol) (map[string]string, error) {
+type EFIDeviceTypeParser func([]byte, EFIDPNodePropertyMap) error
+
+var efiDeviceTypeParserMap = map[int]EFIDeviceTypeParser{
+  EFIMediaHarddriveDevicePath: ParseMediaHardriveDP,
+  EFIMediaFilePathDevicePath: ParseMediaFilePathDP,
+}
+
+func ParseDevicePathNode(data []byte, h EFIDevicePathProtocol) (EFIDPNodePropertyMap, error) {
   if len(data) == 0 {
     return nil, nil
   }
-  m := make(map[string]string)
-  if h.TheType == EFIMediaDevicePathType {
-    switch h.SubType {
-    case EFIMediaHarddriveDP:
-      err := ParseMediaHardriveDP(data, m)
-      if err != nil {
+  m := make(EFIDPNodePropertyMap)
+  if fn, ok := efiDeviceTypeParserMap[h.CombinedType()]; ok {
+    if err := fn(data, m); err != nil {
         return nil, fmt.Errorf("failed to parse DevicePathNode for type %d subtype %d: %w", h.TheType, h.SubType, err)
       }
-    case EFIMediaFilePathDP:
-      err := ParseMediaFilePathDP(data, m)
-      if err != nil {
-        return nil, fmt.Errorf("failed to parse DevicePathNode for type %d subtype %d: %w", h.TheType, h.SubType, err)
-      }
-    }
   }
+  
   if len(m) == 0 {
     return nil, nil
   }
   return m, nil
 }
 
-func ParseMediaFilePathDP(data []byte, m map[string]string) error {
+func ParseMediaFilePathDP(data []byte, m EFIDPNodePropertyMap) error {
   buf := bytes.NewReader(data)
   s, _, err := GetEFIString(buf)
   if err != nil {
@@ -348,7 +351,7 @@ func ParseMediaFilePathDP(data []byte, m map[string]string) error {
   return nil
 }
 
-func ParseMediaHardriveDP(data []byte, m map[string]string) error {
+func ParseMediaHardriveDP(data []byte, m EFIDPNodePropertyMap) error {
   nRead := 0
   // UINT32 PartitionNumber
   val, nr, err := GetEFIUint(data, 32)
@@ -374,9 +377,16 @@ func ParseMediaHardriveDP(data []byte, m map[string]string) error {
   // UINT8 Signature[16]
   sigOffset := nRead
   nRead += 16
-  // UINT8 MBRType
-  mbrType := int(data[nRead])
-  m["MBRType"] = fmt.Sprintf("%d", mbrType)
+  // UINT8 MBRType (Partition Format)
+  partType := int(data[nRead])
+  switch partType {
+  case 1:
+    m["PartitionFormat"] = "MBR"
+  case 2:
+    m["PartitionFormat"] = "GPT"
+  default:
+    return fmt.Errorf("failed to parse MediaHardriveDP.PartitionFormat: unknown partition format %d", partType)
+  }
   nRead++
   // UINT8 SignatureType
   sigType := int(data[nRead])
@@ -384,18 +394,22 @@ func ParseMediaHardriveDP(data []byte, m map[string]string) error {
   switch sigType {
   case 0:
     // no signature, no-op
+    m["SignatureTypeString"] = "No Signature"
+    m["PartitionSignature"] = ""
   case 1: // first 4 bytes as little endian uint 32
     val, _, err = GetEFIUint(data[sigOffset:], 32)
     if err != nil {
       return fmt.Errorf("failed to parse MediaHardriveDP.Signature for SignatureType %d: %w", sigType, err)
     }
-    m["Signature"] = fmt.Sprintf("0x%08x", val)
+    m["PartitionSignature"] = fmt.Sprintf("0x%08x", val)
+    m["SignatureTypeString"] = "MBR Signature"
   case 2:
     s, _, err := GetEFIGUID(data[sigOffset:])
     if err != nil {
       return fmt.Errorf("failed to parse MediaHardriveDP.Signature for SignatureType %d: %w", sigType, err)
     }
-    m["Signature"] = s
+    m["PartitionSignature"] = s
+    m["SignatureTypeString"] = "GUID Signature"
   default:
     return fmt.Errorf("undefined MediaHardriveDP.SignatureType %d", sigType)
   }
