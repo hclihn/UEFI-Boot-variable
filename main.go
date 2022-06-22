@@ -304,6 +304,24 @@ func (l *EFILoadOption) Parse(data []byte) error {
   return nil
 }
 
+func (l EFILoadOption) GetDPTypeProperty(dpType int, prop string) (hasType, hasProp bool, val string) {
+  var b strings.Builder
+  for _, node := range l.FilePathList {
+    if node.CombinedType() != dpType {
+      continue
+    }
+    hasType = true
+    v, ok := node.Properties[prop]
+    if !ok {
+      continue
+    }
+    hasProp = true
+    b.WriteString(v)
+  }
+  val = b.String()
+  return
+}
+
 const (
   // types
   // EFIHardwareDevicePathType (0x01xx), Sec 9.3.2
@@ -346,6 +364,11 @@ func ParseMediaFilePathDP(data []byte, m EFIDPNodePropertyMap) error {
   s, _, err := GetEFIString(buf)
   if err != nil {
     return fmt.Errorf("failed to parse MediaFilePathDP: %w", err)
+  }
+  m["PathNameRaw"] = s
+  s = strings.ReplaceAll(s, "\\", "/")
+  if strings.HasPrefix(s, "/EFI/") {
+    s = "/EFI/"+ strings.ToLower(s[5:])
   }
   m["PathName"] = s
   return nil
@@ -435,10 +458,28 @@ func GetEFIBootItem(idx int) (*EFILoadOption, error) {
   return &loadOpt, nil
 }
 
+func GetCurrentEFIDiskBootPath() (string, error) {
+  index, err := GetEFIBootCurrent()
+  if err != nil {
+    return "", fmt.Errorf("failed to get current EFI disk boot path while getting BootCurrent: %w", err)
+  }
+  loadOpt, err := GetEFIBootItem(index)
+  if err != nil {
+    return "", fmt.Errorf("failed to get current EFI disk boot path while getting Boot%04X: %w", index, err)
+  }
+  hasType, hasProp, val := loadOpt.GetDPTypeProperty(EFIMediaFilePathDevicePath, "PathName")
+  if !hasType {
+     return "", fmt.Errorf("failed to get current EFI disk boot path: missing MediaFilePathDevicePath in Boot%04X data", index)
+  } else if !hasProp {
+    return "", fmt.Errorf("failed to get current EFI disk boot path: missing MediaFilePathDevicePath property FilePath in Boot%04X data", index)
+  }
+  return val, nil
+}
+
 func main() {
   /*
-    "Boot0000-8be4df61-93ca-11d2-aa0d-00e098032b8c",
-    "Boot0001-venHw-ubuntu",
+    "Boot0000-venHw-ubuntu",
+    "Boot0001-8be4df61-93ca-11d2-aa0d-00e098032b8c",
     "Boot0002-PXE-IPv4.data",
     "Boot0004-venMedia-UEFI-shell",
     "Boot0005-PXE-IPv6.data",
@@ -459,10 +500,11 @@ func main() {
     return
   }
   fmt.Printf("Boot Current: %d\n", bc)
-  loadOpt, err := GetEFIBootItem(0)
+  loadOpt, err := GetEFIBootItem(1)
   if err != nil {
     fmt.Println("ERROR:", err)
     return
   }
   fmt.Println(loadOpt)
+  fmt.Println(GetCurrentEFIDiskBootPath())
 }
