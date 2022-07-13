@@ -10,12 +10,33 @@ import (
   "encoding/binary"
   "encoding/hex"
   "unicode/utf16"
+  "regexp"
 )
 
 const debug = false
+const useEFIVarFS = true
 
 // const efiVarDir = "/sys/firmware/efi/vars"
-const efiVarDir = "test"
+
+// deprecated efivars
+const efiVarsDir = "test/vars"
+// new efivarfs
+const efiVarFSDir = "test/efivars"
+
+var (
+  hasEFIVarFS = false
+	efiVarDir   = ""
+)
+
+func init() {
+  if useEFIVarFS {
+    hasEFIVarFS = true
+	  efiVarDir   = efiVarFSDir
+  } else {
+    hasEFIVarFS = false
+	  efiVarDir   = efiVarsDir
+  }
+}
 
 func GetEFIVarData(name string) ([]byte, string, error) {
   ptn := fmt.Sprintf("%s-*", name)
@@ -32,7 +53,10 @@ func GetEFIVarData(name string) ([]byte, string, error) {
     return nil, "", fmt.Errorf("failed to find %q in EFI Variable dir %q: too many found: %q", ptn, efiVarDir, m)
   }
   // Read data
-  thePath := filepath.Join(m[0], "data")
+  thePath := m[0]
+	if !hasEFIVarFS {
+		thePath = filepath.Join(m[0], "data")
+	}
   data, err := os.ReadFile(thePath)
 	if err != nil {
 		return nil, "", fmt.Errorf("failed to read %s file %q: %w", name, thePath, err)
@@ -66,6 +90,9 @@ func GetEFIBootOrder() ([]int, error) {
 	if err != nil {
 		return nil, fmt.Errorf("failed to get BootOrder data: %w", err)
 	}
+  if hasEFIVarFS { // strip off the leading 4-byte attribute
+		data = data[4:]
+	}
   // the data is a list of little-endian uint16 numbers
   l := len(data)
   if l%2 != 0 {
@@ -82,6 +109,9 @@ func GetEFIBootCurrent() (int, error) {
   data, thePath, err := GetEFIVarData("BootCurrent")
 	if err != nil {
 		return -1, fmt.Errorf("failed to get BootCurrent data: %w", err)
+	}
+  if hasEFIVarFS { // strip off the leading 4-byte attribute
+		data = data[4:]
 	}
   // the data is a little-endian uint16 number
   l := len(data)
@@ -451,6 +481,9 @@ func GetEFIBootItem(idx int) (*EFILoadOption, error) {
 	}
   fmt.Println(thePath)
   fmt.Println(hex.Dump(data))
+  if hasEFIVarFS { // strip off the leading 4-byte attribute
+		data = data[4:]
+	}
   var loadOpt EFILoadOption
   if err := loadOpt.Parse(data); err != nil {
 		return nil, fmt.Errorf("failed to parse %s EFILoadOption from %q: %w", name, thePath, err)
@@ -467,13 +500,70 @@ func GetCurrentEFIDiskBootPath() (string, error) {
   if err != nil {
     return "", fmt.Errorf("failed to get current EFI disk boot path while getting Boot%04X: %w", index, err)
   }
+  hasType, hasProp, sig := loadOpt.GetDPTypeProperty(EFIMediaHarddriveDevicePath, "PartitionSignature")
+	if !hasType {
+		return "", fmt.Errorf("failed to get current EFI disk boot info: missing EFIMediaHarddriveDevicePath node in Boot%04X data", index)
+	} else if !hasProp {
+		return "", fmt.Errorf("failed to get current EFI disk boot info: missing EFIMediaHarddriveDevicePath node property 'PartitionSignature' in Boot%04X data", index)
+	}
   hasType, hasProp, val := loadOpt.GetDPTypeProperty(EFIMediaFilePathDevicePath, "PathName")
   if !hasType {
      return "", fmt.Errorf("failed to get current EFI disk boot path: missing MediaFilePathDevicePath in Boot%04X data", index)
   } else if !hasProp {
     return "", fmt.Errorf("failed to get current EFI disk boot path: missing MediaFilePathDevicePath property FilePath in Boot%04X data", index)
   }
-  return val, nil
+  return fmt.Sprintf("%s:%s", sig, val), nil
+}
+
+type FindInfo struct {
+	Path string
+	Info os.FileInfo
+}
+
+// GetFinalTarget gets the final target path for the Path component
+// If Path is a symlink, it will follow it to the end and return a path to that final target
+func (f FindInfo) GetFinalTarget() (string, error) {
+	if f.Info.Mode()&os.ModeSymlink == 0 { // not a symlink
+		return f.Path, nil
+	} else if path, err := filepath.EvalSymlinks(f.Path); err != nil { // follow the link to the end
+		return "", fmt.Errorf("failed to resolve symbolic link %q: %w", f.Path, err)
+	} else {
+		return path, nil
+	}
+}
+
+func FindFile(root string, patterns []string, usePath bool) (found map[string][]FindInfo, err error) {
+	ptn := make([]*regexp.Regexp, len(patterns))
+	for i, p := range patterns {
+		ptn[i], err = regexp.Compile(p)
+		if err != nil {
+			return nil, fmt.Errorf("failed to compile regular expression %q for FindFile: %w", p, err)
+		}
+	}
+	f := make(map[string][]FindInfo) // this will work with the same filename at different locations
+	err = filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return fmt.Errorf("failed to traverse to %q for FindFile: %w", path, err)
+		}
+		for _, p := range ptn {
+			name := info.Name() // file name
+			if usePath {
+				name = path
+			}
+			if p.MatchString(name) { // append the finding
+				f[name] = append(f[name], FindInfo{
+					Path: path,
+					Info: info,
+				})
+				break
+			}
+		}
+		return nil
+	})
+	if len(f) > 0 {
+		found = f
+	}
+	return found, err
 }
 
 func main() {
@@ -488,6 +578,11 @@ func main() {
     "BootCurrent-8be4df61-93ca-11d2-aa0d-00e098032b8c",
     "BootOrder-8be4df61-93ca-11d2-aa0d-00e098032b8c",
   */
+  if useEFIVarFS {
+    fmt.Println("***** Use new efivarfs *****")
+  } else {
+    fmt.Println("***** Use legacy sysfs EFI vars *****")
+  }
 	bo, err := GetEFIBootOrder()
   if err != nil {
     fmt.Println("ERROR:", err)
@@ -507,4 +602,6 @@ func main() {
   }
   fmt.Println(loadOpt)
   fmt.Println(GetCurrentEFIDiskBootPath())
+
+  fmt.Println(FindFile("/home/runner/UEFI-Boot-variable", []string{`/Boot0004-[^/]+/data`}, true))
 }
