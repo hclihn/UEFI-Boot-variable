@@ -1,16 +1,18 @@
 package main
 
 import (
+	"bytes"
+	"encoding/binary"
+	"encoding/hex"
 	"fmt"
-  "os"
-  "io"
-  "bytes"
-  "strings"
-  "path/filepath"
-  "encoding/binary"
-  "encoding/hex"
-  "unicode/utf16"
-  "regexp"
+	"io"
+	"os"
+	"path/filepath"
+	"regexp"
+	"sort"
+	"strconv"
+	"strings"
+	"unicode/utf16"
 )
 
 const debug = false
@@ -355,7 +357,9 @@ func (l EFILoadOption) GetDPTypeProperty(dpType int, prop string) (hasType, hasP
 const (
   // types
   // EFIHardwareDevicePathType (0x01xx), Sec 9.3.2
+  EFIPCIDevicePath = 0x0101
   // EFIAcpiDevicePathType (0x02xx), Sec 9.3.3 and 9.3.4
+  EFIACPIDevicePath = 0x0201
   // EFIMessagingDevicePathType (0x03xx), Sec 9.3.5
   // EFIMediaDevicePathType (0x04xx), Sec 9.3.6
   EFIMediaHarddriveDevicePath = 0x0401
@@ -496,6 +500,10 @@ func GetCurrentEFIDiskBootPath() (string, error) {
   if err != nil {
     return "", fmt.Errorf("failed to get current EFI disk boot path while getting BootCurrent: %w", err)
   }
+  return GetEFIDiskBootPath(index)
+}
+
+func GetEFIDiskBootPath(index int) (string, error) {
   loadOpt, err := GetEFIBootItem(index)
   if err != nil {
     return "", fmt.Errorf("failed to get current EFI disk boot path while getting Boot%04X: %w", index, err)
@@ -566,6 +574,27 @@ func FindFile(root string, patterns []string, usePath bool) (found map[string][]
 	return found, err
 }
 
+func GetBootXXXXList() ([]uint16, error) {
+  info, err := FindFile(efiVarDir, []string{"Boot[0-9A-Fa-f]{4}-"}, false)
+  if err != nil {
+    return nil, fmt.Errorf("failed to get BootXXXXList: %w", err)
+  }
+  list := make([]uint16, 0)
+  for k := range info {
+    fields := strings.SplitN(k, "-", 2)
+    v := strings.TrimPrefix(fields[0], "Boot")
+    i, err := strconv.ParseUint(v, 16, 16)
+    if err != nil {
+      return nil, fmt.Errorf("failed to convert %s in %s to int: %w", v, fields[0], err)
+    }
+    list = append(list, uint16(i))
+  }
+  sort.Slice(list, func(i, j int) bool {
+    return list[i] < list[j]
+  })
+  return list, nil
+}
+
 func main() {
   /*
     "Boot0000-venHw-ubuntu",
@@ -588,13 +617,29 @@ func main() {
     fmt.Println("ERROR:", err)
     return
   }
-  fmt.Printf("Boot Order: %d\n", bo)
+  fmt.Printf("Boot Order: %04x\n", bo)
   bc, err := GetEFIBootCurrent()
   if err != nil {
     fmt.Println("ERROR:", err)
     return
   }
-  fmt.Printf("Boot Current: %d\n", bc)
+  fmt.Printf("Boot Current: %04x\n", bc)
+
+  /*for i := 1; i <= 4; i++ {
+    loadOpt, err := GetEFIBootItem(i)
+    if err != nil {
+      fmt.Println("ERROR:", err)
+      return
+    }
+    var s string
+    if loadOpt.Attributes&0x1 == 0 {
+      s = fmt.Sprintf("Boot%04x", i)
+    } else {
+      s = fmt.Sprintf("Boot%04x*", i)
+    }
+    fmt.Printf("%s: %s\n", s, loadOpt)
+  }
+  
   loadOpt, err := GetEFIBootItem(1)
   if err != nil {
     fmt.Println("ERROR:", err)
@@ -602,6 +647,30 @@ func main() {
   }
   fmt.Println(loadOpt)
   fmt.Println(GetCurrentEFIDiskBootPath())
+*/
+  list, err := GetBootXXXXList()
+  if err != nil {
+    fmt.Println("ERROR:", err)
+    return
+  }
+  fmt.Println(list)
+  for _, v := range list {
+    //fmt.Println(GetEFIDiskBootPath(int(v)))
+    loadOpt, err := GetEFIBootItem(int(v))
+    if err != nil {
+      fmt.Println("ERROR:", err)
+      return
+    }
+    fmt.Println(loadOpt)
+  }
 
-  fmt.Println(FindFile("/home/runner/UEFI-Boot-variable", []string{`/Boot0004-[^/]+/data`}, true))
+  /*for i := 1; i <= 4; i++ {
+    loadOpt, err := GetEFIBootItem(i)
+    if err != nil {
+      fmt.Println("ERROR:", err)
+      return
+    }
+    fmt.Println(loadOpt)
+    fmt.Println(GetEFIDiskBootPath(i))
+  }*/
 }
